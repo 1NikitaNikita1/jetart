@@ -13,11 +13,14 @@ export interface ScrollableListProps {
     className?: string;
 }
 
+type ScrollDirection = 'vertical' | 'horizontal';
+
 interface Geometry {
+    direction: ScrollDirection;
     columns: number;
     itemWidth: number;
     itemHeight: number;
-    rowHeight: number;
+    itemStep: number;
     sidePadding: number;
     minScroll: number;
     maxScroll: number;
@@ -32,10 +35,11 @@ interface VisibleItem {
 const CLICK_MOVE_THRESHOLD = 6;
 
 const createInitialGeometry = (): Geometry => ({
+    direction: 'vertical',
     columns: 1,
     itemWidth: 0,
     itemHeight: 0,
-    rowHeight: 0,
+    itemStep: 0,
     sidePadding: 0,
     minScroll: 0,
     maxScroll: 0
@@ -43,9 +47,15 @@ const createInitialGeometry = (): Geometry => ({
 
 const computeColumns = (width: number): number => {
     const { desktop, tablet } = Config.list.breakpoints;
+
     if (width >= desktop) return 4;
     if (width >= tablet) return 2;
+
     return 1;
+};
+
+const isHorizontalMobile = (width: number, height: number): boolean => {
+    return width < Config.list.breakpoints.desktop && width > height;
 };
 
 const computeGeometry = (width: number, height: number): Geometry => {
@@ -55,30 +65,73 @@ const computeGeometry = (width: number, height: number): Geometry => {
         Config.list.sidePaddingMax
     );
 
-    const columns = computeColumns(width);
+    const direction: ScrollDirection = isHorizontalMobile(width, height) ? 'horizontal' : 'vertical';
+
     const itemGap = Config.list.itemGap;
 
+    if (direction === 'horizontal') {
+        const availableHeight = Math.max(0, height - Config.list.sidePaddingMin * 2);
+
+        const itemHeight = clamp(availableHeight, Config.list.minCardHeight, Config.list.maxCardHeight);
+
+        const itemWidth = itemHeight / Config.list.cardAspectRatio;
+        const itemStep = itemWidth + itemGap;
+
+        const totalContentWidth = sidePadding * 2 + Config.list.itemCount * itemStep - itemGap;
+
+        return {
+            direction,
+            columns: 1,
+            itemWidth,
+            itemHeight,
+            itemStep,
+            sidePadding,
+            minScroll: 0,
+            maxScroll: Math.max(0, totalContentWidth - width)
+        };
+    }
+
+    const columns = computeColumns(width);
+
     const availableWidth = width - sidePadding * 2 - (columns - 1) * itemGap;
+
     const itemWidth = Math.max(0, availableWidth / columns);
+
     const itemHeight = clamp(
         itemWidth * Config.list.cardAspectRatio,
         Config.list.minCardHeight,
         Config.list.maxCardHeight
     );
-    const rowHeight = itemHeight + itemGap;
+
+    const itemStep = itemHeight + itemGap;
 
     const totalRows = Math.ceil(Config.list.itemCount / columns);
-    const totalContentHeight = totalRows * rowHeight - itemGap;
+
+    const totalContentHeight = totalRows * itemStep - itemGap;
+
     const maxScroll = Math.max(0, totalContentHeight - height);
 
-    return { columns, itemWidth, itemHeight, rowHeight, sidePadding, minScroll: 0, maxScroll };
+    return {
+        direction,
+        columns,
+        itemWidth,
+        itemHeight,
+        itemStep,
+        sidePadding,
+        minScroll: 0,
+        maxScroll
+    };
 };
 
 export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
     const rootRef = useRef<HTMLDivElement>(null);
     const layerRef = useRef<HTMLDivElement>(null);
 
-    const [viewport, setViewport] = useState({ width: 0, height: 0 });
+    const [viewport, setViewport] = useState({
+        width: 0,
+        height: 0
+    });
+
     const [visibleItems, setVisibleItems] = useState<VisibleItem[]>([]);
     const [geometry, setGeometry] = useState<Geometry>(createInitialGeometry());
 
@@ -87,10 +140,11 @@ export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
     const viewportRef = useRef(viewport);
     const geometryRef = useRef<Geometry>(createInitialGeometry());
 
-    const scrollYRef = useRef(0);
+    const scrollRef = useRef(0);
+
     const isDraggingRef = useRef(false);
     const activePointerIdRef = useRef<number | null>(null);
-    const lastPointerYRef = useRef(0);
+    const lastPointerPositionRef = useRef(0);
     const movedDistanceRef = useRef(0);
 
     const isSnappingBackRef = useRef(false);
@@ -99,47 +153,113 @@ export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
     const inertiaRef = useRef(
         new InertiaScroller(Config.scroll.inertiaDecayPerSecond, Config.scroll.inertiaMinVelocity)
     );
+
     const velocityTrackerRef = useRef(new VelocityTracker());
 
     const rafIdRef = useRef<number | null>(null);
     const lastFrameTimeRef = useRef<number | null>(null);
-    const windowSignatureRef = useRef<string>('');
+    const windowSignatureRef = useRef('');
+
+    const getPointerPosition = useCallback((event: PointerEvent | ReactPointerEvent<HTMLDivElement>): number => {
+        return geometryRef.current.direction === 'horizontal' ? event.clientX : event.clientY;
+    }, []);
 
     const applyScrollTransform = useCallback(() => {
-        if (layerRef.current) {
-            layerRef.current.style.transform = `translateY(${-scrollYRef.current}px)`;
-        }
+        if (!layerRef.current) return;
+
+        const { direction } = geometryRef.current;
+
+        layerRef.current.style.transform =
+            direction === 'horizontal'
+                ? `translateX(${-scrollRef.current}px)`
+                : `translateY(${-scrollRef.current}px)`;
     }, []);
 
     const updateLayout = useCallback(() => {
-        const geometry = geometryRef.current;
-        const { rowHeight, columns } = geometry;
-        if (rowHeight <= 0 || columns <= 0) return;
+        const currentGeometry = geometryRef.current;
+        const { direction, itemStep, columns } = currentGeometry;
+
+        if (itemStep <= 0 || columns <= 0) return;
 
         const bufferRows = Config.list.bufferRows;
-        const firstVisibleRow = Math.max(0, Math.floor(scrollYRef.current / rowHeight) - bufferRows);
+
+        if (direction === 'horizontal') {
+            const firstVisibleIndex = Math.max(0, Math.floor(scrollRef.current / itemStep) - bufferRows);
+
+            const visibleCount = Math.ceil(viewportRef.current.width / itemStep) + bufferRows * 2 + 1;
+
+            const signature = [
+                direction,
+                firstVisibleIndex,
+                visibleCount,
+                currentGeometry.itemWidth,
+                currentGeometry.itemHeight,
+                currentGeometry.sidePadding
+            ].join(':');
+
+            if (signature === windowSignatureRef.current) return;
+
+            windowSignatureRef.current = signature;
+
+            const items: VisibleItem[] = [];
+
+            const y = Math.max(0, (viewportRef.current.height - currentGeometry.itemHeight) / 2);
+
+            for (let index = 0; index < visibleCount; index++) {
+                const dataIndex = firstVisibleIndex + index;
+
+                if (dataIndex >= Config.list.itemCount) break;
+
+                items.push({
+                    dataIndex,
+                    x: currentGeometry.sidePadding + dataIndex * itemStep,
+                    y
+                });
+            }
+
+            setVisibleItems(items);
+            return;
+        }
+
+        const firstVisibleRow = Math.max(0, Math.floor(scrollRef.current / itemStep) - bufferRows);
+
         const firstVisibleIndex = firstVisibleRow * columns;
 
-        const visibleRows = Math.ceil(viewportRef.current.height / rowHeight);
+        const visibleRows = Math.ceil(viewportRef.current.height / itemStep);
+
         const rowsWithBuffer = visibleRows + bufferRows * 2 + 1;
+
         const poolSize = rowsWithBuffer * columns;
 
-        const signature = `${firstVisibleIndex}:${poolSize}:${geometry.itemWidth}:${geometry.itemHeight}`;
+        const signature = [
+            direction,
+            firstVisibleIndex,
+            poolSize,
+            currentGeometry.itemWidth,
+            currentGeometry.itemHeight,
+            currentGeometry.sidePadding,
+            columns
+        ].join(':');
+
         if (signature === windowSignatureRef.current) return;
+
         windowSignatureRef.current = signature;
 
         const items: VisibleItem[] = [];
+
         for (let poolIndex = 0; poolIndex < poolSize; poolIndex++) {
             const dataIndex = firstVisibleIndex + poolIndex;
+
             if (dataIndex >= Config.list.itemCount) break;
 
             const row = Math.floor(dataIndex / columns);
+
             const col = dataIndex % columns;
 
             items.push({
                 dataIndex,
-                x: geometry.sidePadding + col * (geometry.itemWidth + Config.list.itemGap),
-                y: row * rowHeight
+                x: currentGeometry.sidePadding + col * (currentGeometry.itemWidth + Config.list.itemGap),
+                y: row * itemStep
             });
         }
 
@@ -148,15 +268,18 @@ export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
 
     const applyRubberBand = useCallback((value: number): number => {
         const { minScroll, maxScroll } = geometryRef.current;
+
         const { rubberBandResistance, rubberBandLimit } = Config.scroll;
 
         if (value < minScroll) {
             const overshoot = Math.min(minScroll - value, rubberBandLimit * 3);
+
             return minScroll - overshoot * rubberBandResistance;
         }
 
         if (value > maxScroll) {
             const overshoot = Math.min(value - maxScroll, rubberBandLimit * 3);
+
             return maxScroll + overshoot * rubberBandResistance;
         }
 
@@ -165,18 +288,23 @@ export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
 
     const beginSnapBack = useCallback(() => {
         inertiaRef.current.stop();
+
         isSnappingBackRef.current = true;
+
         const { minScroll, maxScroll } = geometryRef.current;
-        snapTargetRef.current = scrollYRef.current < minScroll ? minScroll : maxScroll;
+
+        snapTargetRef.current = scrollRef.current < minScroll ? minScroll : maxScroll;
     }, []);
 
     const stepSnapBack = useCallback(
         (deltaMS: number) => {
             const t = 1 - Math.pow(Config.scroll.snapBackSpeed, deltaMS / 1000);
-            scrollYRef.current += (snapTargetRef.current - scrollYRef.current) * t;
 
-            if (Math.abs(snapTargetRef.current - scrollYRef.current) < 0.5) {
-                scrollYRef.current = snapTargetRef.current;
+            scrollRef.current += (snapTargetRef.current - scrollRef.current) * t;
+
+            if (Math.abs(snapTargetRef.current - scrollRef.current) < 0.5) {
+                scrollRef.current = snapTargetRef.current;
+
                 isSnappingBackRef.current = false;
             }
 
@@ -191,17 +319,20 @@ export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
             if (lastFrameTimeRef.current === null) {
                 lastFrameTimeRef.current = time;
             }
+
             const deltaMS = time - lastFrameTimeRef.current;
+
             lastFrameTimeRef.current = time;
 
             if (!isDraggingRef.current) {
                 if (isSnappingBackRef.current) {
                     stepSnapBack(deltaMS);
                 } else if (inertiaRef.current.isMoving) {
-                    scrollYRef.current += inertiaRef.current.update(deltaMS);
+                    scrollRef.current += inertiaRef.current.update(deltaMS);
+
                     const { minScroll, maxScroll } = geometryRef.current;
 
-                    if (scrollYRef.current < minScroll || scrollYRef.current > maxScroll) {
+                    if (scrollRef.current < minScroll || scrollRef.current > maxScroll) {
                         beginSnapBack();
                     }
 
@@ -214,41 +345,71 @@ export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
         };
 
         rafIdRef.current = requestAnimationFrame(tick);
+
         return () => {
-            if (rafIdRef.current !== null) cancelAnimationFrame(rafIdRef.current);
+            if (rafIdRef.current !== null) {
+                cancelAnimationFrame(rafIdRef.current);
+            }
         };
     }, [applyScrollTransform, beginSnapBack, stepSnapBack, updateLayout]);
 
     useEffect(() => {
         const node = rootRef.current;
+
         if (!node) return;
 
         const handleResize = (width: number, height: number) => {
-            viewportRef.current = { width, height };
+            const previousGeometry = geometryRef.current;
+
+            const progress =
+                previousGeometry.maxScroll > 0 ? clamp(scrollRef.current / previousGeometry.maxScroll, 0, 1) : 0;
+
             const nextGeometry = computeGeometry(width, height);
+
+            viewportRef.current = {
+                width,
+                height
+            };
+
             geometryRef.current = nextGeometry;
 
-            const { minScroll, maxScroll } = nextGeometry;
-            scrollYRef.current = clamp(scrollYRef.current, minScroll, maxScroll);
+            scrollRef.current = clamp(
+                progress * nextGeometry.maxScroll,
+                nextGeometry.minScroll,
+                nextGeometry.maxScroll
+            );
+
+            inertiaRef.current.stop();
+            isSnappingBackRef.current = false;
 
             applyScrollTransform();
+
             windowSignatureRef.current = '';
+
             updateLayout();
-            setViewport({ width, height });
-            setGeometry(nextGeometry); // ← new
+
+            setViewport({
+                width,
+                height
+            });
+
+            setGeometry(nextGeometry);
         };
 
         const observer = new ResizeObserver(([entry]) => {
             const { width, height } = entry.contentRect;
+
             handleResize(width, height);
         });
 
         observer.observe(node);
+
         return () => observer.disconnect();
     }, [applyScrollTransform, updateLayout]);
 
     useEffect(() => {
         const node = rootRef.current;
+
         if (!node) return;
 
         const onWheel = (event: WheelEvent) => {
@@ -257,40 +418,61 @@ export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
             isSnappingBackRef.current = false;
             inertiaRef.current.stop();
 
-            let delta = event.deltaY;
-            if (event.deltaMode === 1) delta *= 18;
-            else if (event.deltaMode === 2) delta *= viewportRef.current.height;
+            const { direction } = geometryRef.current;
+
+            let delta = direction === 'horizontal' ? event.deltaX || event.deltaY : event.deltaY;
+
+            if (event.deltaMode === 1) {
+                delta *= 18;
+            } else if (event.deltaMode === 2) {
+                delta *= direction === 'horizontal' ? viewportRef.current.width : viewportRef.current.height;
+            }
 
             const { minScroll, maxScroll } = geometryRef.current;
-            scrollYRef.current = clamp(scrollYRef.current + delta, minScroll, maxScroll);
+
+            scrollRef.current = clamp(scrollRef.current + delta, minScroll, maxScroll);
 
             applyScrollTransform();
             updateLayout();
         };
 
-        node.addEventListener('wheel', onWheel, { passive: false });
-        return () => node.removeEventListener('wheel', onWheel);
+        node.addEventListener('wheel', onWheel, {
+            passive: false
+        });
+
+        return () => {
+            node.removeEventListener('wheel', onWheel);
+        };
     }, [applyScrollTransform, updateLayout]);
 
     useEffect(() => {
         const onPointerMove = (event: PointerEvent) => {
-            if (!isDraggingRef.current || event.pointerId !== activePointerIdRef.current) return;
+            if (!isDraggingRef.current || event.pointerId !== activePointerIdRef.current) {
+                return;
+            }
 
-            const currentY = event.clientY;
-            const deltaY = currentY - lastPointerYRef.current;
-            lastPointerYRef.current = currentY;
-            movedDistanceRef.current += Math.abs(deltaY);
-            velocityTrackerRef.current.addSample(currentY);
+            const currentPosition = getPointerPosition(event);
 
-            const proposedScrollY = scrollYRef.current - deltaY;
-            scrollYRef.current = applyRubberBand(proposedScrollY);
+            const delta = currentPosition - lastPointerPositionRef.current;
+
+            lastPointerPositionRef.current = currentPosition;
+
+            movedDistanceRef.current += Math.abs(delta);
+
+            velocityTrackerRef.current.addSample(currentPosition);
+
+            const proposedScroll = scrollRef.current - delta;
+
+            scrollRef.current = applyRubberBand(proposedScroll);
 
             applyScrollTransform();
             updateLayout();
         };
 
         const onPointerUp = (event: PointerEvent) => {
-            if (event.pointerId !== activePointerIdRef.current) return;
+            if (event.pointerId !== activePointerIdRef.current) {
+                return;
+            }
 
             activePointerIdRef.current = null;
             isDraggingRef.current = false;
@@ -300,38 +482,56 @@ export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
                 -Config.scroll.maxFlingVelocity,
                 Config.scroll.maxFlingVelocity
             );
+
             inertiaRef.current.setVelocity(-pointerVelocity);
 
             const { minScroll, maxScroll } = geometryRef.current;
-            if (scrollYRef.current < minScroll || scrollYRef.current > maxScroll) {
+
+            if (scrollRef.current < minScroll || scrollRef.current > maxScroll) {
                 beginSnapBack();
             }
         };
 
         window.addEventListener('pointermove', onPointerMove);
+
         window.addEventListener('pointerup', onPointerUp);
+
         window.addEventListener('pointercancel', onPointerUp);
 
         return () => {
             window.removeEventListener('pointermove', onPointerMove);
+
             window.removeEventListener('pointerup', onPointerUp);
+
             window.removeEventListener('pointercancel', onPointerUp);
         };
-    }, [applyRubberBand, applyScrollTransform, beginSnapBack, updateLayout]);
+    }, [applyRubberBand, applyScrollTransform, beginSnapBack, getPointerPosition, updateLayout]);
 
-    const handlePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-        if (activePointerIdRef.current !== null) return;
+    const handlePointerDown = useCallback(
+        (event: ReactPointerEvent<HTMLDivElement>) => {
+            if (activePointerIdRef.current !== null) {
+                return;
+            }
 
-        activePointerIdRef.current = event.pointerId;
-        isDraggingRef.current = true;
-        isSnappingBackRef.current = false;
-        movedDistanceRef.current = 0;
-        inertiaRef.current.stop();
+            activePointerIdRef.current = event.pointerId;
 
-        lastPointerYRef.current = event.clientY;
-        velocityTrackerRef.current.reset();
-        velocityTrackerRef.current.addSample(event.clientY);
-    }, []);
+            isDraggingRef.current = true;
+            isSnappingBackRef.current = false;
+
+            movedDistanceRef.current = 0;
+
+            inertiaRef.current.stop();
+
+            const position = getPointerPosition(event);
+
+            lastPointerPositionRef.current = position;
+
+            velocityTrackerRef.current.reset();
+
+            velocityTrackerRef.current.addSample(position);
+        },
+        [getPointerPosition]
+    );
 
     const handleClickCapture = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
         if (movedDistanceRef.current > CLICK_MOVE_THRESHOLD) {
@@ -355,7 +555,9 @@ export const ScrollableList: FC<ScrollableListProps> = ({ className }) => {
                     visibleItems.map((item) => (
                         <ItemSlot
                             key={item.dataIndex}
-                            style={{ transform: `translate(${item.x}px, ${item.y}px)` }}
+                            style={{
+                                transform: `translate(${item.x}px, ${item.y}px)`
+                            }}
                         >
                             <ListItem
                                 width={geometry.itemWidth}
@@ -389,6 +591,7 @@ const ItemsLayer = styled.div`
     top: 0;
     left: 0;
     width: 100%;
+    height: 100%;
     will-change: transform;
 `;
 
